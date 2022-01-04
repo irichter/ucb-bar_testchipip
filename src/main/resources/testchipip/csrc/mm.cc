@@ -7,6 +7,11 @@
 #include <cstring>
 #include <cassert>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <fesvr/byteorder.h>
+#include <fesvr/elf.h>
+#define PT_TLS 7
+#include <sys/stat.h>
 
 void mm_t::write(uint64_t addr, uint8_t *data, uint64_t strb, uint64_t size)
 {
@@ -120,6 +125,107 @@ void mm_magic_t::tick(
     while (!rresp.empty()) rresp.pop();
     cycle = 0;
   }
+}
+
+template <bool isBE, typename T> static inline T to_native(T n)
+{
+  if (isBE) {
+    return swap(n);
+  }
+  return n;
+}
+
+template <typename PHDR, bool isBE, typename EHDR>
+static void load_elf_to_data(
+  uint64_t start,
+  const EHDR *eh,
+  size_t file_size,
+  uint8_t *data,
+  size_t data_size)
+{
+  assert(
+    file_size >= (to_native<isBE>(eh->e_phoff) +
+                  (sizeof(PHDR) * to_native<isBE>(eh->e_phnum))));
+  const PHDR *ph =
+    (const PHDR *) (((const uint8_t *) eh) + to_native<isBE>(eh->e_phoff));
+  static_assert(
+    sizeof(eh->e_phoff) == sizeof(ph->p_offset), "Wrong PHDR for EHDR");
+  for (uint16_t i = 0; i < eh->e_phnum; i++) {
+    switch (to_native<isBE>(ph[i].p_type)) {
+    case PT_LOAD:
+    case PT_TLS:
+      fprintf(stderr, "Section[%d](%d):", i, to_native<isBE>(ph[i].p_type));
+      auto memsz = to_native<isBE>(ph[i].p_memsz);
+      fprintf(stderr, " memsz: 0x%lx", (uint64_t) memsz);
+      if (memsz) {
+        auto vaddr = to_native<isBE>(ph[i].p_vaddr);
+        assert(vaddr >= start);
+        auto memoff = vaddr - start;
+        auto filesz = to_native<isBE>(ph[i].p_filesz);
+        fprintf(
+          stderr, " vaddr=0x%lx memoff=0x%lx filesz=0x%lx", (uint64_t) vaddr,
+          (uint64_t) memoff, (uint64_t) filesz);
+        assert(file_size >= (to_native<isBE>(ph[i].p_offset) + filesz));
+        assert(filesz <= memsz);
+        assert(memoff + memsz <= data_size);
+        memcpy(
+          data + memoff,
+          (((const uint8_t *) eh) + to_native<isBE>(ph[i].p_offset)), filesz);
+        memset(data + memoff + filesz, '\0', memsz - filesz);
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+}
+
+void mm_t::load_elf(uint64_t start, const char *fname)
+{
+  int fd = open(fname, O_RDONLY);
+  struct stat s;
+  assert(fd != -1);
+  if (fstat(fd, &s) < 0) {
+    fprintf(stderr, "Couldn't open loadelf file %s\n", fname);
+    abort();
+  }
+  size_t file_size = s.st_size;
+
+  char *buf = (char *) mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  assert(buf != MAP_FAILED);
+  close(fd);
+
+  fprintf(stderr, "load_elf processing %s\n", fname);
+
+  assert(file_size >= sizeof(Elf64_Ehdr));
+  const Elf64_Ehdr *eh64 = (const Elf64_Ehdr *) buf;
+  assert(IS_ELF32(*eh64) || IS_ELF64(*eh64));
+  assert(IS_ELFLE(*eh64) || IS_ELFBE(*eh64));
+  assert(IS_ELF_EXEC(*eh64));
+  assert(IS_ELF_RISCV(*eh64) || IS_ELF_EM_NONE(*eh64));
+  assert(IS_ELF_VCURRENT(*eh64));
+
+  if (IS_ELFLE(*eh64)) {
+    if (IS_ELF32(*eh64))
+      load_elf_to_data<Elf32_Phdr, false>(
+        start, (const Elf32_Ehdr *) buf, file_size, data, size);
+    else
+      load_elf_to_data<Elf64_Phdr, false>(
+        start, (const Elf64_Ehdr *) buf, file_size, data, size);
+  } else {
+#ifndef RISCV_ENABLE_DUAL_ENDIAN
+    throw std::invalid_argument("Specified ELF is big endian.  Configure with "
+                                "--enable-dual-endian to enable support");
+#else
+    memif->set_target_endianness(memif_endianness_big);
+    if (IS_ELF32(*eh64))
+      load_elf_to_data<Elf32_Phdr, true>(
+        start, (const Elf32_Ehdr *) buf, file_size, data, size);
+    else
+      load_elf_to_data<Elf64_Phdr, true>(
+        start, (const Elf64_Ehdr *) buf, file_size, data, size);
+#endif
+  }
+
+  munmap(buf, file_size);
 }
 
 void mm_t::load_mem(unsigned long start, const char *fname)

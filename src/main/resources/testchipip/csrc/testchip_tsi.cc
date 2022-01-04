@@ -10,6 +10,8 @@ testchip_tsi_t::testchip_tsi_t(int argc, char** argv, bool can_have_loadmem) : t
   for (auto& arg : args) {
     if (arg.find("+loadmem=") == 0)
       has_loadmem = can_have_loadmem;
+    if (arg.find("+loadelf=") == 0)
+      has_loadmem = can_have_loadmem;
     if (arg.find("+init_write=0x") == 0) {
       auto d = arg.find(":0x");
       if (d == std::string::npos) {
